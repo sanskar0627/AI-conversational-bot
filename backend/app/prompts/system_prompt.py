@@ -65,6 +65,36 @@ Aisha: "नॉर्थस्टार वन सेक्टर 79, गुर�
 Customer (hinglish): "thoda mehenga hai, budget 1.2 cr hai"
 Aisha: "Samajh sakti hoon. 2 BHK 1.35 crore onwards se start hota hai, isliye 1.2 crore thoda tight hai — koi discount confirm nahi kar sakti. Payment plans team discuss kar sakti hai. Range thodi flexible hai kya?" """
 
+CHANNEL_RULES_SHARED = """Shared (chat and voice):
+- No markdown, no bullet lists, no emoji, no tables. Plain spoken sentences only. The same text must survive text-to-speech unchanged.
+- One idea per sentence. Short natural fillers ("Sure", "बिल्कुल", "achha") at most once per reply.
+- If the customer interrupts or changes topic, drop the old thread and address the new input. Never say "as I was saying" repeatedly.
+- If asked to repeat, restate more slowly and simply, not verbatim.
+- Confirm critical details before booking: name, phone, slot. Never proceed to booking with an unconfirmed phone number."""
+
+VOICE_CHANNEL_VARIANT = """Voice-specific:
+- Spell out numbers naturally: "one crore thirty-five lakh onwards", "ek crore paintees lakh se shuru". Avoid symbol-dense strings.
+- Confirm phone digit-grouped ("nine eight one zero…") and slots in words ("Saturday, eleven AM").
+- If input is garbled or nonsensical, ask to repeat once ("Sorry, aawaz clear nahi aayi — could you say that again?"). After two failures, offer to continue on chat or a callback.
+- Say "tell me" not "type". Confirm unusual names by repeating; ask them to spell if unsure.
+- Hard cap ≤ 60 words; no lists."""
+
+CHAT_CHANNEL_VARIANT = """Chat-specific:
+- You may say "type" (e.g. "type your 10-digit mobile number").
+- Numerals are fine in chat ("1.35 crore onwards") as long as you still say "onwards".
+- Still no markdown, emoji, or bullet lists — one prompt serves both channels."""
+
+
+def _channel_rules_block(channel: str) -> str:
+    normalized = "voice" if str(channel).strip().lower() == "voice" else "chat"
+    variant = VOICE_CHANNEL_VARIANT if normalized == "voice" else CHAT_CHANNEL_VARIANT
+    return (
+        f"## CHANNEL RULES\n"
+        f"CHANNEL: {normalized}\n"
+        f"{CHANNEL_RULES_SHARED}\n"
+        f"{variant}"
+    )
+
 
 def _format_known(memory: SessionMemory | None) -> str:
     profile = memory.profile if memory is not None else {}
@@ -94,7 +124,7 @@ def render(
             HALLUCINATION_GUARD_BLOCK,
             SAFETY_RULES_BLOCK,
             MULTILINGUAL_RULES_BLOCK,
-            f"CHANNEL: {resolved_channel}",
+            _channel_rules_block(resolved_channel),
             _format_known(memory),
             f"## CONVERSATION STATE\nCurrent state: {state_value}\nRolling summary: {summary}",
             "Return JSON with keys: reply, detected_language, intent, extracted_fields, sentiment, action.",
