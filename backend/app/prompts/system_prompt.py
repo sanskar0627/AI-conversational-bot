@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from app.memory.schemas import ConversationState, SessionMemory
 from app.prompts import facts
 
@@ -117,27 +119,105 @@ Closing — summarize agreed next steps and thank them, in the customer's langua
 
 Intents (pick the closest): greeting, pricing, location, amenities, availability, configuration, budget_inquiry, site_visit, reschedule, cancel_booking, busy, call_later, not_interested, stop_communication, unknown_question, human_agent, objection, thank_you, goodbye, abusive_offtopic."""
 
+KNOWN_CUSTOMER_INFO_HEADER = "## KNOWN CUSTOMER INFO"
+NEVER_REASK_RULE = "Never re-ask anything listed here; reference it naturally."
+
+CONVERSATION_STATE_HEADER = "## CONVERSATION STATE"
+
+
+def _profile_lines(profile: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for key, value in profile.items():
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, dict):
+            inner = value.get("value", value)
+            confidence = value.get("confidence")
+            if inner in (None, ""):
+                continue
+            suffix = f" (confidence: {confidence})" if confidence not in (None, "") else ""
+            lines.append(f"- {key}: {inner}{suffix}")
+        else:
+            lines.append(f"- {key}: {value}")
+    return lines
+
 
 def _format_known(memory: SessionMemory | None) -> str:
-    profile = memory.profile if memory is not None else {}
-    lines = [f"- {key}: {value}" for key, value in profile.items() if value not in (None, "")]
+    lines: list[str] = []
+    if memory is not None:
+        lines.extend(_profile_lines(memory.profile))
+        booking = memory.booking or {}
+        status = booking.get("status")
+        if status and status != "none":
+            lines.append(f"- booking_status: {status}")
+            if booking.get("slot"):
+                lines.append(f"- booking_slot: {booking['slot']}")
+            if booking.get("confirmation_id"):
+                lines.append(f"- confirmation_id: {booking['confirmation_id']}")
+        if memory.escalation:
+            reason = memory.escalation.get("reason") or "triggered"
+            lines.append(f"- escalation: {reason}")
+        if memory.objections:
+            types = [
+                item.get("type", "unspecified")
+                for item in memory.objections
+                if isinstance(item, dict)
+            ]
+            if types:
+                lines.append(f"- objections_so_far: {', '.join(str(t) for t in types)}")
     body = "\n".join(lines) if lines else "(none yet)"
-    return f"## KNOWN CUSTOMER INFO\n{body}"
+    return f"{KNOWN_CUSTOMER_INFO_HEADER}\n{NEVER_REASK_RULE}\n{body}"
+
+
+def _format_state(
+    memory: SessionMemory | None,
+    state: ConversationState | str | None,
+    tool_result: str | None,
+) -> str:
+    session_state = state or (memory.state if memory is not None else ConversationState.GREETING)
+    if isinstance(session_state, ConversationState):
+        state_value = session_state.value
+    else:
+        state_value = str(session_state)
+    summary = ""
+    previous_language = ""
+    recent_intents: list[str] = []
+    if memory is not None:
+        summary = memory.rolling_summary or ""
+        if memory.language_history:
+            previous_language = memory.language_history[-1]
+        recent_intents = [
+            str(item.get("intent"))
+            for item in memory.intent_history[-5:]
+            if isinstance(item, dict) and item.get("intent")
+        ]
+    summary_text = summary.strip() or "(none)"
+    language_text = previous_language or "(unknown)"
+    intents_text = ", ".join(recent_intents) if recent_intents else "(none)"
+    tool_text = (tool_result or "").strip() or "(none this turn)"
+    return (
+        f"{CONVERSATION_STATE_HEADER}\n"
+        f"Current state: {state_value}\n"
+        f"Previous customer language: {language_text}\n"
+        f"Recent intents: {intents_text}\n"
+        f"Rolling summary: {summary_text}\n"
+        f"TOOL RESULT: {tool_text}"
+    )
 
 
 def render(
     memory: SessionMemory | None = None,
     state: ConversationState | str | None = None,
     channel: str | None = None,
+    *,
+    tool_result: str | None = None,
 ) -> str:
-    """Assemble the per-turn system prompt from the named blocks."""
+    """Assemble the per-turn system prompt from the named blocks.
+
+    `tool_result` is reserved for Stage 04/06: the engine injects real booking
+    or escalation outcomes so the model relays them instead of inventing them.
+    """
     resolved_channel = channel or (memory.channel if memory is not None else None) or "chat"
-    session_state = state or (memory.state if memory is not None else ConversationState.GREETING)
-    if isinstance(session_state, ConversationState):
-        state_value = session_state.value
-    else:
-        state_value = str(session_state)
-    summary = (memory.rolling_summary if memory is not None else "") or "(none)"
     return "\n\n".join(
         [
             IDENTITY_BLOCK,
@@ -149,7 +229,7 @@ def render(
             _channel_rules_block(resolved_channel),
             BEHAVIOUR_PLAYBOOKS_BLOCK,
             _format_known(memory),
-            f"## CONVERSATION STATE\nCurrent state: {state_value}\nRolling summary: {summary}",
+            _format_state(memory, state, tool_result),
             "Return JSON with keys: reply, detected_language, intent, extracted_fields, sentiment, action.",
         ]
     )
