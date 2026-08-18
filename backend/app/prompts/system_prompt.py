@@ -1,11 +1,33 @@
-"""Canonical system prompt: ordered blocks assembled per turn by render()."""
+"""Canonical system prompt: ordered blocks assembled per turn by render().
+
+Human-readable twin (with design rationale): repo-root PROMPT.md.
+The prompt is channel-agnostic: the same text works for chat and voice; only
+the CHANNEL line and a short variant block change at render time.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 from app.memory.schemas import ConversationState, SessionMemory
+from app.models.llm_output import AgentAction, DetectedLanguage, Sentiment
 from app.prompts import facts
+from app.services.intent import Intent
+
+# Headings tests (and PROMPT.md) assert. Order matches Stage 03's 11 blocks.
+BLOCK_HEADINGS: tuple[str, ...] = (
+    "## IDENTITY",
+    "## FACTS",
+    "## HARD RULES",
+    "## HALLUCINATION GUARD",
+    "## SAFETY RULES",
+    "## MULTILINGUAL RULES",
+    "## CHANNEL RULES",
+    "## BEHAVIOUR PLAYBOOKS",
+    "## KNOWN CUSTOMER INFO",
+    "## CONVERSATION STATE",
+    "## OUTPUT CONTRACT",
+)
 
 IDENTITY_BLOCK = """## IDENTITY
 You are Aisha, a senior sales consultant at Northstar Homes, representing project Northstar One in Sector 79, Gurugram.
@@ -124,6 +146,35 @@ NEVER_REASK_RULE = "Never re-ask anything listed here; reference it naturally."
 
 CONVERSATION_STATE_HEADER = "## CONVERSATION STATE"
 
+OUTPUT_CONTRACT_HEADER = "## OUTPUT CONTRACT"
+
+OUTPUT_FEW_SHOTS = """Example 1 — English pricing turn
+Customer: "Hi, what's the 2 BHK price?"
+{"reply":"Hi, I am Aisha from Northstar Homes. 2 BHK homes at Northstar One in Sector 79, Gurugram start from 1.35 crore onwards. Are you looking at a 2 BHK or a 3 BHK?","detected_language":"english","intent":"pricing","extracted_fields":{},"sentiment":"neutral","action":"none"}
+
+Example 2 — Hinglish objection turn
+Customer: "thoda mehenga lag raha hai yaar"
+{"reply":"Samajh sakti hoon — ghar badi decision hai. 2 BHK 1.35 crore onwards se start hota hai, koi extra discount confirm nahi kar sakti, lekin visit pe value better judge hogi. Site visit dekhna chahoge?","detected_language":"hinglish","intent":"objection","extracted_fields":{},"sentiment":"negative","action":"none"}"""
+
+
+def _output_contract_block() -> str:
+    intents = " | ".join(item.value for item in Intent)
+    languages = " | ".join(item.value for item in DetectedLanguage)
+    sentiments = " | ".join(item.value for item in Sentiment)
+    actions = " | ".join(item.value for item in AgentAction)
+    return f"""{OUTPUT_CONTRACT_HEADER}
+Return a single JSON object, no markdown fence, with exactly these keys:
+- reply: string, ≤ 60 words, plain text in the customer's language
+- detected_language: {languages}
+- intent: {intents}
+- extracted_fields: object. Include only fields you actually heard this turn. Keys: name, phone, budget, configuration, timeline, purpose, financing, city, visit_interest. Use {{}} when nothing was extracted — never null.
+- sentiment: {sentiments}
+- action: {actions}
+
+action guide: none (default); propose_slots (ready to offer visit times); confirm_booking (relaying a successful booking tool result); escalate (human handoff); close (conversation wrapping up: busy, call-later, not-interested, goodbye after next steps); stop (opt-out).
+
+{OUTPUT_FEW_SHOTS}"""
+
 
 def _profile_lines(profile: dict[str, Any]) -> list[str]:
     lines: list[str] = []
@@ -230,6 +281,6 @@ def render(
             BEHAVIOUR_PLAYBOOKS_BLOCK,
             _format_known(memory),
             _format_state(memory, state, tool_result),
-            "Return JSON with keys: reply, detected_language, intent, extracted_fields, sentiment, action.",
+            _output_contract_block(),
         ]
     )
