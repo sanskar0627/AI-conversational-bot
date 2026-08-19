@@ -234,6 +234,36 @@ Customer: `thoda mehenga lag raha hai yaar`
 }
 ```
 
+#### Few-shot: English human request
+
+Customer: `connect me to a human`
+
+```json
+{
+  "reply": "Of course. A senior consultant will call you within 2 working hours. Could you share your 10-digit mobile number?",
+  "detected_language": "english",
+  "intent": "human_agent",
+  "extracted_fields": {},
+  "sentiment": "neutral",
+  "action": "escalate"
+}
+```
+
+#### Few-shot: English stop request
+
+Customer: `stop messaging me`
+
+```json
+{
+  "reply": "Understood. We will not contact you again. Take care.",
+  "detected_language": "english",
+  "intent": "stop_communication",
+  "extracted_fields": {},
+  "sentiment": "neutral",
+  "action": "stop"
+}
+```
+
 ---
 
 ## Analytics summarization prompt
