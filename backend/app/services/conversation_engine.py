@@ -6,18 +6,28 @@ import time
 
 from app.memory.schemas import TERMINAL_STATES, ConversationState, SessionMemory
 from app.memory.store import SessionStore
-from app.models.llm_output import AgentAction, ExtractedFields, StructuredTurn
+from app.models.llm_output import AgentAction, DetectedLanguage, ExtractedFields, StructuredTurn
 from app.models.responses import BookingSnapshot, ChatResponse
 from app.prompts import system_prompt
 from app.services.booking import BookingService
 from app.services.escalation import EscalationService
-from app.services.intent import Intent
+from app.services.intent import (
+    Intent,
+    classify_objection,
+    consecutive_intent_count,
+    infer_language,
+    is_stop_request,
+)
 from app.services.llm_client import LLMClient
 from app.utils.logging import get_logger, mask_pii
 
 logger = get_logger(__name__)
 
-STOPPED_REPLY = "Understood. We won't contact you again. Take care."
+STOPPED_REPLIES = {
+    "english": "Understood. We won't contact you again. Take care.",
+    "hindi": "समझ गया। हम आपसे दोबारा संपर्क नहीं करेंगे। आपका दिन शुभ हो।",
+    "hinglish": "Samajh gaya. Hum aapko dobara contact nahi karenge. Take care.",
+}
 CLOSED_REPLY = (
     "This conversation has ended. Start a new session if you'd like help with Northstar One."
 )
@@ -192,8 +202,34 @@ def next_state(
     return mapped
 
 
+def apply_stop_override(user_message: str, turn: StructuredTurn) -> StructuredTurn:
+    """If regex says stop, it wins over whatever the LLM returned."""
+    if not is_stop_request(user_message):
+        return turn
+    language = infer_language(user_message, fallback=turn.detected_language.value)
+    return turn.model_copy(
+        update={
+            "intent": Intent.stop_communication,
+            "action": AgentAction.stop,
+            "reply": STOPPED_REPLIES.get(language, STOPPED_REPLIES["english"]),
+            "detected_language": _to_language(language),
+        }
+    )
+
+
+def stopped_reply(language: str) -> str:
+    return STOPPED_REPLIES.get(language, STOPPED_REPLIES["english"])
+
+
+def _to_language(value: str) -> DetectedLanguage:
+    try:
+        return DetectedLanguage(value)
+    except ValueError:
+        return DetectedLanguage.english
+
+
 class ConversationEngine:
-    """Load memory → prompt → LLM → merge → action (stub) → ChatResponse."""
+    """Load memory → (stop override | prompt → LLM → checks → actions) → ChatResponse."""
 
     def __init__(
         self,
@@ -212,23 +248,40 @@ class ConversationEngine:
         if memory.state in TERMINAL_STATES:
             return self._terminal_response(memory)
 
+        if is_stop_request(message):
+            return self._handle_stop(memory, message)
+
         started = time.perf_counter()
+        start_state = memory.state
         prompt = system_prompt.render(
             memory=memory,
             state=memory.state,
             channel=memory.channel,
         )
         history = self._history_messages(memory)
+        user_payload = {"role": "user", "content": f"Customer message: {message}"}
         turn = await self._llm.complete_turn(
             system_prompt=prompt,
-            messages=[
-                *history,
-                {"role": "user", "content": f"Customer message: {message}"},
-            ],
+            messages=[*history, user_payload],
         )
+        turn = apply_stop_override(message, turn)
+
         self._merge_extracted_fields(memory, turn.extracted_fields)
-        self._execute_action(memory, turn)
         self._persist_turn(memory, message, turn)
+
+        booking_event = None
+        reason = self._escalation.should_escalate(
+            memory, turn, user_message=message, start_state=start_state
+        )
+        self._advance_state(
+            memory,
+            turn,
+            start_state=start_state,
+            booking_event=booking_event,
+            escalate_reason=reason,
+            user_message=message,
+        )
+        self._maybe_resolve_objection(memory, start_state)
         self._store.save(memory)
 
         latency_ms = int((time.perf_counter() - started) * 1000)
@@ -243,8 +296,28 @@ class ConversationEngine:
         logger.debug("user_message=%s", mask_pii(message))
         return self._to_response(memory, turn.reply, turn.detected_language.value)
 
+    def _handle_stop(self, memory: SessionMemory, message: str) -> ChatResponse:
+        fallback = memory.language_history[-1] if memory.language_history else "english"
+        language = infer_language(message, fallback=fallback)
+        reply = stopped_reply(language)
+        turn = StructuredTurn(
+            reply=reply,
+            detected_language=_to_language(language),
+            intent=Intent.stop_communication,
+            extracted_fields=ExtractedFields(),
+            action=AgentAction.stop,
+        )
+        memory.state = ConversationState.STOPPED
+        self._persist_turn(memory, message, turn)
+        self._store.save(memory)
+        return self._to_response(memory, reply, language)
+
     def _terminal_response(self, memory: SessionMemory) -> ChatResponse:
-        reply = STOPPED_REPLY if memory.state == ConversationState.STOPPED else CLOSED_REPLY
+        if memory.state == ConversationState.STOPPED:
+            fallback = memory.language_history[-1] if memory.language_history else "english"
+            reply = stopped_reply(fallback)
+        else:
+            reply = CLOSED_REPLY
         language = memory.language_history[-1] if memory.language_history else "english"
         return self._to_response(memory, reply, language)
 
@@ -262,9 +335,59 @@ class ConversationEngine:
         for key, value in fields.model_dump(exclude_none=True).items():
             memory.profile[key] = value
 
-    def _execute_action(self, memory: SessionMemory, turn: StructuredTurn) -> None:
-        """Action handlers are wired in later Stage 04 commits."""
-        return
+    def _advance_state(
+        self,
+        memory: SessionMemory,
+        turn: StructuredTurn,
+        *,
+        start_state: ConversationState,
+        booking_event: str | None,
+        escalate_reason: str | None,
+        user_message: str,
+    ) -> None:
+        if turn.action == AgentAction.stop or turn.intent == Intent.stop_communication:
+            memory.state = ConversationState.STOPPED
+            return
+
+        if escalate_reason:
+            self._apply_escalation(memory, escalate_reason, user_message)
+            return
+
+        memory.state = next_state(
+            start_state,
+            turn.intent,
+            action=turn.action,
+            booking_event=booking_event,
+            consecutive_unknowns=consecutive_intent_count(
+                memory.intent_history, Intent.unknown_question
+            ),
+            booking_failure_count=int(memory.booking.get("failure_count") or 0),
+        )
+
+    def _apply_escalation(
+        self, memory: SessionMemory, reason: str, user_message: str
+    ) -> None:
+        payload = self._escalation.build_payload(
+            memory, reason, user_message=user_message
+        )
+        memory.escalation = payload
+        memory.state = ConversationState.ESCALATED
+
+    def _maybe_resolve_objection(
+        self, memory: SessionMemory, start_state: ConversationState
+    ) -> None:
+        if start_state != ConversationState.OBJECTION_HANDLING:
+            return
+        if memory.state not in {
+            ConversationState.QUALIFICATION,
+            ConversationState.BOOKING,
+            ConversationState.DISCOVERY,
+        }:
+            return
+        for item in reversed(memory.objections):
+            if not item.get("resolved"):
+                item["resolved"] = True
+                break
 
     def _persist_turn(self, memory: SessionMemory, user_message: str, turn: StructuredTurn) -> None:
         memory.turns.append({"role": "user", "text": user_message})
@@ -279,6 +402,14 @@ class ConversationEngine:
         memory.language_history.append(turn.detected_language.value)
         turn_no = sum(1 for record in memory.turns if record.get("role") == "user")
         memory.intent_history.append({"turn": turn_no, "intent": turn.intent.value})
+        if turn.intent == Intent.objection:
+            memory.objections.append(
+                {
+                    "turn": turn_no,
+                    "type": classify_objection(user_message),
+                    "resolved": False,
+                }
+            )
 
     def _to_response(self, memory: SessionMemory, reply: str, language: str) -> ChatResponse:
         return ChatResponse(
