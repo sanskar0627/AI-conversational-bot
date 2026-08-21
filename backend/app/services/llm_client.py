@@ -78,6 +78,25 @@ class LLMClient:
         logger.warning("LLM JSON parse failed after repair; falling back to raw text")
         return self._fallback_turn(raw)
 
+    async def complete_text(
+        self,
+        system_prompt: str,
+        user_content: str,
+        *,
+        max_tokens: int = 160,
+    ) -> str:
+        """Plain-text completion used for rolling summaries (not StructuredTurn)."""
+        payload = {
+            "model": self._settings.openrouter_model,
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        return (await self._complete_raw(payload)).strip()
+
     def _build_payload(
         self,
         system_prompt: str,

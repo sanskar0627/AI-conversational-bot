@@ -14,6 +14,7 @@ from tests.conftest import FakeLLMClient, canned_turn
 EXPECTED_PATHS = [
     "/api/health",
     "/api/session",
+    "/api/session/{session_id}/memory",
     "/api/chat",
     "/api/booking/slots",
     "/api/book-site-visit",
@@ -32,7 +33,7 @@ def _error(response) -> dict:
     return body
 
 
-def test_openapi_lists_all_seven_endpoints(client: TestClient) -> None:
+def test_openapi_lists_all_endpoints(client: TestClient) -> None:
     spec = client.get("/openapi.json").json()
     for path in EXPECTED_PATHS:
         assert path in spec["paths"], f"missing {path}"
@@ -64,7 +65,7 @@ def test_session_chat_booking_analytics_round_trip(client: TestClient, fake_llm:
     assert body["reply"] == "2 BHK starts from 1.35 crore onwards."
     assert body["state"] == "FAQ"
     assert body["language"] == "english"
-    assert body["memory_snapshot"]["configuration"] == "2 BHK"
+    assert body["memory_snapshot"]["profile"]["configuration"]["value"] == "2 BHK"
     assert fake_llm.calls
 
     slots = client.get("/api/booking/slots", params={"session_id": session_id})

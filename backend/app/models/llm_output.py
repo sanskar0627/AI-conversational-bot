@@ -30,19 +30,22 @@ class Sentiment(str, Enum):
 
 
 class ExtractedFields(BaseModel):
-    """Lead fields the model may extract. Unknown keys are ignored until Stage 05."""
+    """Lead fields extracted this turn. Empty keys are omitted; extra keys ignored."""
 
     model_config = ConfigDict(extra="ignore")
 
     name: str | None = None
     phone: str | None = None
     budget: str | None = None
+    budget_min: Any | None = None
+    budget_max: Any | None = None
     configuration: str | None = None
     timeline: str | None = None
     purpose: str | None = None
     financing: str | None = None
     city: str | None = None
     visit_interest: Any | None = None
+    field_confidence: dict[str, str] | None = None
 
 
 class StructuredTurn(BaseModel):

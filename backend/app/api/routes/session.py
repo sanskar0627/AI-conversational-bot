@@ -1,12 +1,12 @@
-"""Session lifecycle: POST /api/session, POST /api/end-session."""
+"""Session lifecycle: POST /api/session, POST /api/end-session, GET memory."""
 
 from fastapi import APIRouter, Depends
 
 from app.dependencies import get_store
 from app.memory.schemas import ConversationState
-from app.memory.store import SessionStore
+from app.memory.store import SessionStore, build_memory_snapshot
 from app.models.requests import CreateSessionRequest, EndSessionRequest
-from app.models.responses import AnalyticsResponse, SessionResponse
+from app.models.responses import AnalyticsResponse, MemorySnapshot, SessionResponse
 from app.services.analytics import build_stub_analytics
 
 router = APIRouter()
@@ -23,6 +23,15 @@ def create_session(
 ) -> SessionResponse:
     session = store.create(channel=payload.channel.value)
     return SessionResponse(session_id=session.session_id, greeting=STATIC_GREETING)
+
+
+@router.get("/session/{session_id}/memory", response_model=MemorySnapshot)
+def get_session_memory(
+    session_id: str,
+    store: SessionStore = Depends(get_store),
+) -> MemorySnapshot:
+    session = store.get(session_id)
+    return build_memory_snapshot(session)
 
 
 @router.post("/end-session", response_model=AnalyticsResponse)
