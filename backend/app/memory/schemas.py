@@ -237,6 +237,12 @@ def default_booking() -> dict[str, Any]:
         "confirmation_id": None,
         "failure_count": 0,
         "history": [],
+        "validation_attempts": 0,
+        "offered_slots": [],
+        "alternatives": [],
+        "reason": None,
+        "follow_up_required": False,
+        "follow_up_reason": None,
     }
 
 

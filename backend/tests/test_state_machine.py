@@ -109,6 +109,10 @@ def test_propose_slots_enters_booking() -> None:
     assert next_state(BOOKING_FAILED, Intent.site_visit, action=AgentAction.propose_slots) == BOOKING
 
 
+def test_cancel_booking_enters_follow_up() -> None:
+    assert next_state(BOOKING, Intent.cancel_booking, booking_event="cancelled") == FOLLOW_UP
+
+
 def test_stopped_and_closed_are_terminal() -> None:
     assert next_state(STOPPED, Intent.pricing) == STOPPED
     assert next_state(STOPPED, Intent.greeting, action=AgentAction.close) == STOPPED

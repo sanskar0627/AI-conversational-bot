@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_engine, get_store, reset_singletons
+from app.dependencies import (
+    get_booking_service,
+    get_engine,
+    get_escalation_service,
+    get_store,
+    reset_singletons,
+)
 from app.main import app
 from app.models.llm_output import (
     AgentAction,
@@ -85,7 +91,12 @@ def fake_llm() -> FakeLLMClient:
 @pytest.fixture
 def client(fake_llm: FakeLLMClient):
     reset_singletons()
-    engine = ConversationEngine(store=get_store(), llm_client=fake_llm)
+    engine = ConversationEngine(
+        store=get_store(),
+        llm_client=fake_llm,
+        booking=get_booking_service(),
+        escalation=get_escalation_service(),
+    )
     app.dependency_overrides[get_engine] = lambda: engine
     with TestClient(app) as test_client:
         yield test_client

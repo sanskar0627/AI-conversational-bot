@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
+import pytest
 from fastapi.testclient import TestClient
 
-from app.dependencies import get_store
+from app.dependencies import get_booking_service, get_engine, get_store, reset_singletons
 from app.exceptions import CreditsExhaustedError
+from app.main import app
 from app.models.llm_output import ExtractedFields
+from app.services.booking import IST, BookingService, is_sunday_morning
+from app.services.conversation_engine import ConversationEngine
 from tests.conftest import FakeLLMClient, canned_turn
 
 EXPECTED_PATHS = [
@@ -70,7 +74,9 @@ def test_session_chat_booking_analytics_round_trip(client: TestClient, fake_llm:
 
     slots = client.get("/api/booking/slots", params={"session_id": session_id})
     assert slots.status_code == 200
-    assert slots.json()["slots"]
+    offered = slots.json()["slots"]
+    assert offered
+    slot_id = offered[0]["slot_id"]
 
     booked = client.post(
         "/api/book-site-visit",
@@ -78,12 +84,14 @@ def test_session_chat_booking_analytics_round_trip(client: TestClient, fake_llm:
             "session_id": session_id,
             "name": "Rahul",
             "phone": "9810012345",
-            "slot_id": "stub-sat-1100",
+            "slot_id": slot_id,
         },
     )
     assert booked.status_code == 200
     assert booked.json()["success"] is True
-    assert booked.json()["confirmation_id"] == "NS-STUB01"
+    confirmation_id = booked.json()["confirmation_id"]
+    assert confirmation_id.startswith("NS-")
+    assert len(confirmation_id) == 9
 
     ended = client.post("/api/end-session", json={"session_id": session_id})
     assert ended.status_code == 200
@@ -180,8 +188,140 @@ def test_invalid_booking_phone_is_validation_error(client: TestClient) -> None:
             "session_id": session_id,
             "name": "Rahul",
             "phone": "12345",
-            "slot_id": "stub-sat-1100",
+            "slot_id": "not-a-slot",
         },
     )
     assert response.status_code == 422
     assert _error(response)["error_code"] == "VALIDATION_ERROR"
+
+
+FROZEN = datetime(2026, 9, 2, 9, 0, tzinfo=IST)
+
+
+@pytest.fixture
+def frozen_client(fake_llm: FakeLLMClient):
+    reset_singletons()
+    booking = BookingService(now_fn=lambda: FROZEN, failure_mode="deterministic")
+    engine = ConversationEngine(store=get_store(), llm_client=fake_llm, booking=booking)
+    app.dependency_overrides[get_engine] = lambda: engine
+    app.dependency_overrides[get_booking_service] = lambda: booking
+    with TestClient(app) as test_client:
+        yield test_client, booking
+    app.dependency_overrides.clear()
+    reset_singletons()
+
+
+def test_ui_booking_confirms_and_blocks_the_taken_slot(frozen_client) -> None:
+    client, booking = frozen_client
+    created = client.post("/api/session", json={"channel": "chat"})
+    session_id = created.json()["session_id"]
+
+    slots = client.get("/api/booking/slots", params={"session_id": session_id})
+    assert slots.status_code == 200
+    offered = slots.json()["slots"]
+    assert offered
+    assert all("slot_id" in item and "label" in item for item in offered)
+    open_slot = next(
+        item
+        for item in offered
+        if not is_sunday_morning(booking.get_slot(item["slot_id"]).starts_at)
+    )
+
+    booked = client.post(
+        "/api/book-site-visit",
+        json={
+            "session_id": session_id,
+            "name": "Rahul",
+            "phone": "9810012345",
+            "slot_id": open_slot["slot_id"],
+        },
+    )
+    body = booked.json()
+    assert booked.status_code == 200
+    assert body["success"] is True
+    assert body["confirmation_id"].startswith("NS-")
+    assert len(body["confirmation_id"]) == 9
+    assert body["slot"] == open_slot["slot_id"]
+
+    memory = client.get(f"/api/session/{session_id}/memory").json()
+    assert memory["booking"]["status"] == "confirmed"
+    assert memory["booking"]["confirmation_id"] == body["confirmation_id"]
+
+    other = client.post("/api/session", json={"channel": "chat"}).json()["session_id"]
+    taken = client.post(
+        "/api/book-site-visit",
+        json={
+            "session_id": other,
+            "name": "Priya",
+            "phone": "9876543210",
+            "slot_id": open_slot["slot_id"],
+        },
+    ).json()
+    assert taken["success"] is False
+    assert taken["reason"] == "slot_taken"
+    assert taken["alternatives"]
+    assert len(taken["alternatives"]) == 3
+
+
+def test_sunday_morning_ui_booking_returns_alternatives(frozen_client) -> None:
+    client, booking = frozen_client
+    session_id = client.post("/api/session", json={"channel": "chat"}).json()["session_id"]
+    sunday = next(slot for slot in booking.list_inventory() if is_sunday_morning(slot.starts_at))
+
+    failed = client.post(
+        "/api/book-site-visit",
+        json={
+            "session_id": session_id,
+            "name": "Rahul",
+            "phone": "9810012345",
+            "slot_id": sunday.slot_id,
+        },
+    )
+    body = failed.json()
+    assert failed.status_code == 200
+    assert body["success"] is False
+    assert body["reason"] == "slot_taken"
+    assert body["alternatives"]
+    assert len(body["alternatives"]) == 3
+    memory = client.get(f"/api/session/{session_id}/memory").json()
+    assert memory["booking"]["failure_count"] == 1
+    assert memory["booking"]["status"] == "failed"
+
+
+def test_ui_reschedule_issues_a_new_confirmation_id(frozen_client) -> None:
+    client, booking = frozen_client
+    session_id = client.post("/api/session", json={"channel": "chat"}).json()["session_id"]
+    open_slots = [
+        slot
+        for slot in booking.list_inventory()
+        if slot.available and not is_sunday_morning(slot.starts_at)
+    ]
+    first, second = open_slots[0], open_slots[1]
+
+    original = client.post(
+        "/api/book-site-visit",
+        json={
+            "session_id": session_id,
+            "name": "Rahul",
+            "phone": "9810012345",
+            "slot_id": first.slot_id,
+        },
+    ).json()
+    moved = client.post(
+        "/api/book-site-visit",
+        json={
+            "session_id": session_id,
+            "name": "Rahul",
+            "phone": "9810012345",
+            "slot_id": second.slot_id,
+        },
+    ).json()
+    assert moved["success"] is True
+    assert moved["confirmation_id"] != original["confirmation_id"]
+    assert moved["slot"] == second.slot_id
+    assert booking.get_slot(first.slot_id).available is True
+    assert booking.get_slot(second.slot_id).available is False
+    memory = client.get(f"/api/session/{session_id}/memory").json()
+    assert memory["booking"]["status"] == "confirmed"
+    events = [item.get("event") for item in memory["booking"]["history"]]
+    assert "rescheduled" in events

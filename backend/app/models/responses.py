@@ -22,18 +22,24 @@ class SessionResponse(BaseModel):
     greeting: str
 
 
+class SlotInfo(BaseModel):
+    slot_id: str
+    label: str
+    available: bool = True
+
+
 class BookingSnapshot(BaseModel):
     status: str = "none"
     slot: str | None = None
     confirmation_id: str | None = None
     failure_count: int = 0
     history: list[Any] = Field(default_factory=list)
-
-
-class SlotInfo(BaseModel):
-    slot_id: str
-    label: str
-    available: bool = True
+    reason: str | None = None
+    alternatives: list[SlotInfo] = Field(default_factory=list)
+    offered_slots: list[str] = Field(default_factory=list)
+    follow_up_required: bool = False
+    follow_up_reason: str | None = None
+    validation_attempts: int = 0
 
 
 class SlotsResponse(BaseModel):
@@ -44,6 +50,7 @@ class BookingResponse(BaseModel):
     success: bool
     confirmation_id: str | None = None
     slot: str | None = None
+    slot_label: str | None = None
     reason: str | None = None
     alternatives: list[SlotInfo] | None = None
 

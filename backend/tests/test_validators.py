@@ -1,6 +1,6 @@
 """Unit tests for Indian phone and name validators."""
 
-from app.utils.validators import is_valid_name, is_valid_phone, normalize_phone
+from app.utils.validators import is_valid_name, is_valid_phone, is_valid_slot_id, normalize_phone
 
 
 def test_valid_ten_digit_phones() -> None:
@@ -39,3 +39,17 @@ def test_invalid_names() -> None:
     assert not is_valid_name("")
     assert not is_valid_name("A")
     assert not is_valid_name("  x  ")
+
+
+def test_valid_slot_ids() -> None:
+    assert is_valid_slot_id("2026-08-23-1100")
+    assert is_valid_slot_id("2026-09-06-1000")
+    assert is_valid_slot_id("2026-09-06-1630")
+
+
+def test_invalid_slot_ids() -> None:
+    assert not is_valid_slot_id("")
+    assert not is_valid_slot_id("stub-sat-1100")
+    assert not is_valid_slot_id("2026-08-23")
+    assert not is_valid_slot_id("2026-08-23-2460")
+    assert not is_valid_slot_id("2026-08-23-1159")
