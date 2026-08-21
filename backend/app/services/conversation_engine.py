@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import time
 
+from app.exceptions import CreditsExhaustedError, LLMRateLimitedError, LLMTimeoutError
 from app.memory.schemas import TERMINAL_STATES, ConversationState, SessionMemory
 from app.memory.store import SessionStore
 from app.models.llm_output import AgentAction, DetectedLanguage, ExtractedFields, StructuredTurn
 from app.models.responses import BookingSnapshot, ChatResponse
-from app.prompts import system_prompt
+from app.prompts import facts, system_prompt
 from app.services.booking import BookingService
 from app.services.escalation import EscalationService
 from app.services.intent import (
@@ -31,7 +33,35 @@ STOPPED_REPLIES = {
 CLOSED_REPLY = (
     "This conversation has ended. Start a new session if you'd like help with Northstar One."
 )
+SAFE_PRICE_REPLY = (
+    "Let me have our team confirm the exact figures. 2 BHK starts from 1.35 crore "
+    "onwards and 3 BHK from 1.75 crore onwards. What else can I help with?"
+)
+HALLUCINATION_REPAIR_INSTRUCTION = (
+    "Your previous reply mentioned prices, discounts, or figures that are not in FACTS. "
+    "Only 2 BHK ₹1.35 crore onwards and 3 BHK ₹1.75 crore onwards may be stated. "
+    "Never invent discounts, possession dates, or other prices. "
+    "Return ONLY valid JSON matching the schema, with a corrected reply."
+)
 HISTORY_WINDOW = 10
+
+# Numbers the agent may attach to crore / ₹. Lakh equivalents of the same prices.
+_ALLOWED_CRORE = {facts.PRICE_2BHK_CRORE, facts.PRICE_3BHK_CRORE}
+_ALLOWED_LAKH = {facts.PRICE_2BHK_CRORE * 100, facts.PRICE_3BHK_CRORE * 100}
+
+_CURRENCY_AMOUNT_RE = re.compile(
+    r"(?:₹|rs\.?\s*|inr\s*)(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
+_UNIT_AMOUNT_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(crore|cr\b|lakh|lac)",
+    re.IGNORECASE,
+)
+_DISCOUNT_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(?:%|percent)(?:\s*(?:off|discount))?"
+    r"|(?:discount|off)\s*(?:of\s*)?(\d+(?:[.,]\d+)?)\s*(?:%|percent)",
+    re.IGNORECASE,
+)
 
 # (state, intent) → next state. Overrides (stop / escalate / booking events) run first.
 TRANSITION_TABLE: dict[tuple[ConversationState, Intent], ConversationState] = {
@@ -202,6 +232,29 @@ def next_state(
     return mapped
 
 
+def reply_has_disallowed_figures(text: str) -> bool:
+    """True when the reply quotes a price/discount outside the closed fact sheet."""
+    if not text:
+        return False
+    if _DISCOUNT_RE.search(text):
+        return True
+    for match in _CURRENCY_AMOUNT_RE.finditer(text):
+        amount = _parse_amount(match.group(1))
+        if amount is not None and amount not in _ALLOWED_CRORE and amount not in _ALLOWED_LAKH:
+            return True
+    for match in _UNIT_AMOUNT_RE.finditer(text):
+        amount = _parse_amount(match.group(1))
+        unit = match.group(2).lower()
+        if amount is None:
+            continue
+        if unit.startswith("cr"):
+            if amount not in _ALLOWED_CRORE:
+                return True
+        elif amount not in _ALLOWED_LAKH:
+            return True
+    return False
+
+
 def apply_stop_override(user_message: str, turn: StructuredTurn) -> StructuredTurn:
     """If regex says stop, it wins over whatever the LLM returned."""
     if not is_stop_request(user_message):
@@ -219,6 +272,13 @@ def apply_stop_override(user_message: str, turn: StructuredTurn) -> StructuredTu
 
 def stopped_reply(language: str) -> str:
     return STOPPED_REPLIES.get(language, STOPPED_REPLIES["english"])
+
+
+def _parse_amount(raw: str) -> float | None:
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError:
+        return None
 
 
 def _to_language(value: str) -> DetectedLanguage:
@@ -264,12 +324,15 @@ class ConversationEngine:
             system_prompt=prompt,
             messages=[*history, user_payload],
         )
+        turn = await self._hallucination_post_check(
+            memory, prompt, [*history, user_payload], turn
+        )
         turn = apply_stop_override(message, turn)
 
         self._merge_extracted_fields(memory, turn.extracted_fields)
         self._persist_turn(memory, message, turn)
 
-        booking_event = None
+        booking_event = self._execute_booking_action(memory, turn)
         reason = self._escalation.should_escalate(
             memory, turn, user_message=message, start_state=start_state
         )
@@ -321,6 +384,46 @@ class ConversationEngine:
         language = memory.language_history[-1] if memory.language_history else "english"
         return self._to_response(memory, reply, language)
 
+    async def _hallucination_post_check(
+        self,
+        memory: SessionMemory,
+        prompt: str,
+        messages: list[dict[str, str]],
+        turn: StructuredTurn,
+    ) -> StructuredTurn:
+        if not reply_has_disallowed_figures(turn.reply):
+            return turn
+        logger.warning(
+            "hallucination_post_check session=%s event=caught",
+            memory.session_id,
+        )
+        repair_messages = [
+            *messages,
+            {"role": "assistant", "content": turn.reply},
+            {"role": "user", "content": HALLUCINATION_REPAIR_INSTRUCTION},
+        ]
+        try:
+            repaired = await self._llm.complete_turn(
+                system_prompt=prompt,
+                messages=repair_messages,
+            )
+        except (CreditsExhaustedError, LLMTimeoutError, LLMRateLimitedError):
+            raise
+        except Exception:
+            logger.exception(
+                "hallucination_post_check session=%s event=repair_failed",
+                memory.session_id,
+            )
+            return turn.model_copy(update={"reply": SAFE_PRICE_REPLY})
+
+        if reply_has_disallowed_figures(repaired.reply):
+            logger.warning(
+                "hallucination_post_check session=%s event=replaced_canned",
+                memory.session_id,
+            )
+            return repaired.model_copy(update={"reply": SAFE_PRICE_REPLY})
+        return repaired
+
     def _history_messages(self, memory: SessionMemory) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
         for record in memory.turns[-HISTORY_WINDOW:]:
@@ -334,6 +437,46 @@ class ConversationEngine:
         """Simple non-null merge. Conflict/overwrite rules land in Stage 05."""
         for key, value in fields.model_dump(exclude_none=True).items():
             memory.profile[key] = value
+
+    def _execute_booking_action(
+        self, memory: SessionMemory, turn: StructuredTurn
+    ) -> str | None:
+        """Delegate propose/confirm to BookingService (stub until Stage 06)."""
+        if turn.action == AgentAction.propose_slots:
+            slots = self._booking.get_available_slots()
+            memory.booking["status"] = "slots_offered"
+            memory.booking.setdefault("history", []).append(
+                {"event": "propose_slots", "count": len(slots)}
+            )
+            return "retry" if memory.state == ConversationState.BOOKING_FAILED else None
+
+        if turn.action != AgentAction.confirm_booking:
+            return None
+
+        name = memory.profile.get("name")
+        phone = memory.profile.get("phone")
+        slot_id = memory.profile.get("slot_id") or memory.booking.get("slot")
+        if not name or not phone or not slot_id:
+            return None
+
+        result = self._booking.attempt_booking(
+            session_id=memory.session_id,
+            name=str(name),
+            phone=str(phone),
+            slot_id=str(slot_id),
+        )
+        history = memory.booking.setdefault("history", [])
+        if result.success:
+            memory.booking["status"] = "confirmed"
+            memory.booking["confirmation_id"] = result.confirmation_id
+            memory.booking["slot"] = result.slot
+            history.append({"event": "confirmed", "id": result.confirmation_id})
+            return "confirmed"
+
+        memory.booking["failure_count"] = int(memory.booking.get("failure_count") or 0) + 1
+        memory.booking["status"] = "failed"
+        history.append({"event": "failed", "reason": result.reason})
+        return "failed"
 
     def _advance_state(
         self,
