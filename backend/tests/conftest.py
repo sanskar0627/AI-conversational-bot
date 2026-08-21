@@ -38,8 +38,10 @@ class FakeLLMClient:
         self,
         turn: StructuredTurn | None = None,
         error: Exception | None = None,
+        turns: list[StructuredTurn] | None = None,
     ) -> None:
         self.turn = turn or canned_turn()
+        self.turns = turns
         self.error = error
         self.calls: list[tuple[str, list[dict[str, str]]]] = []
 
@@ -51,6 +53,9 @@ class FakeLLMClient:
         self.calls.append((system_prompt, messages))
         if self.error is not None:
             raise self.error
+        if self.turns:
+            index = min(len(self.calls) - 1, len(self.turns) - 1)
+            return self.turns[index]
         return self.turn
 
 
