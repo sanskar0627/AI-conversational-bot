@@ -62,7 +62,7 @@ def test_session_chat_booking_analytics_round_trip(client: TestClient, fake_llm:
     assert chat.status_code == 200
     body = chat.json()
     assert body["reply"] == "2 BHK starts from 1.35 crore onwards."
-    assert body["state"] == "GREETING"
+    assert body["state"] == "FAQ"
     assert body["language"] == "english"
     assert body["memory_snapshot"]["configuration"] == "2 BHK"
     assert fake_llm.calls
