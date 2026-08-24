@@ -48,11 +48,28 @@ class BookingResponse(BaseModel):
     alternatives: list[SlotInfo] | None = None
 
 
+class ProfileFieldSnapshot(BaseModel):
+    value: Any
+    confidence: str
+    last_updated_turn: int = 0
+
+
+class MemorySnapshot(BaseModel):
+    """Public memory view for the MemoryPanel and GET /session/{id}/memory."""
+
+    profile: dict[str, ProfileFieldSnapshot] = Field(default_factory=dict)
+    state: str
+    intent_history: list[Any] = Field(default_factory=list)
+    objections: list[Any] = Field(default_factory=list)
+    booking: BookingSnapshot = Field(default_factory=BookingSnapshot)
+    language: str | None = None
+
+
 class ChatResponse(BaseModel):
     reply: str
     state: str
     language: str
-    memory_snapshot: dict[str, Any] = Field(default_factory=dict)
+    memory_snapshot: MemorySnapshot
     booking: BookingSnapshot = Field(default_factory=BookingSnapshot)
 
 
