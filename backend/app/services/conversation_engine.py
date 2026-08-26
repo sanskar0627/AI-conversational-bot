@@ -6,8 +6,16 @@ import re
 import time
 
 from app.exceptions import CreditsExhaustedError, LLMRateLimitedError, LLMTimeoutError
-from app.memory.schemas import TERMINAL_STATES, ConversationState, SessionMemory
-from app.memory.store import SessionStore
+from app.memory.schemas import (
+    HISTORY_WINDOW,
+    TERMINAL_STATES,
+    ConversationState,
+    SessionMemory,
+    TurnRecord,
+    utc_now,
+)
+from app.memory.store import SessionStore, build_memory_snapshot, merge_extracted_fields
+from app.memory.summary import refresh_rolling_summary
 from app.models.llm_output import AgentAction, DetectedLanguage, ExtractedFields, StructuredTurn
 from app.models.responses import BookingSnapshot, ChatResponse
 from app.prompts import facts, system_prompt
@@ -43,8 +51,6 @@ HALLUCINATION_REPAIR_INSTRUCTION = (
     "Never invent discounts, possession dates, or other prices. "
     "Return ONLY valid JSON matching the schema, with a corrected reply."
 )
-HISTORY_WINDOW = 10
-
 # Numbers the agent may attach to crore / ₹. Lakh equivalents of the same prices.
 _ALLOWED_CRORE = {facts.PRICE_2BHK_CRORE, facts.PRICE_3BHK_CRORE}
 _ALLOWED_LAKH = {facts.PRICE_2BHK_CRORE * 100, facts.PRICE_3BHK_CRORE * 100}
@@ -329,8 +335,15 @@ class ConversationEngine:
         )
         turn = apply_stop_override(message, turn)
 
-        self._merge_extracted_fields(memory, turn.extracted_fields)
-        self._persist_turn(memory, message, turn)
+        turn_no = memory.user_turn_count() + 1
+        merge_extracted_fields(
+            memory,
+            turn.extracted_fields,
+            turn_no=turn_no,
+            user_message=message,
+        )
+        self._persist_turn(memory, message, turn, turn_no=turn_no)
+        await refresh_rolling_summary(memory, self._llm)
 
         booking_event = self._execute_booking_action(memory, turn)
         reason = self._escalation.should_escalate(
@@ -371,7 +384,7 @@ class ConversationEngine:
             action=AgentAction.stop,
         )
         memory.state = ConversationState.STOPPED
-        self._persist_turn(memory, message, turn)
+        self._persist_turn(memory, message, turn, turn_no=memory.user_turn_count() + 1)
         self._store.save(memory)
         return self._to_response(memory, reply, language)
 
@@ -426,17 +439,10 @@ class ConversationEngine:
 
     def _history_messages(self, memory: SessionMemory) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
-        for record in memory.turns[-HISTORY_WINDOW:]:
-            role = record.get("role")
-            text = record.get("text")
-            if role in {"user", "assistant"} and isinstance(text, str):
-                messages.append({"role": role, "content": text})
+        for record in memory.recent_turns(HISTORY_WINDOW):
+            if record.role in {"user", "assistant"} and record.text:
+                messages.append({"role": record.role, "content": record.text})
         return messages
-
-    def _merge_extracted_fields(self, memory: SessionMemory, fields: ExtractedFields) -> None:
-        """Simple non-null merge. Conflict/overwrite rules land in Stage 05."""
-        for key, value in fields.model_dump(exclude_none=True).items():
-            memory.profile[key] = value
 
     def _execute_booking_action(
         self, memory: SessionMemory, turn: StructuredTurn
@@ -455,7 +461,7 @@ class ConversationEngine:
 
         name = memory.profile.get("name")
         phone = memory.profile.get("phone")
-        slot_id = memory.profile.get("slot_id") or memory.booking.get("slot")
+        slot_id = memory.booking.get("slot")
         if not name or not phone or not slot_id:
             return None
 
@@ -532,18 +538,35 @@ class ConversationEngine:
                 item["resolved"] = True
                 break
 
-    def _persist_turn(self, memory: SessionMemory, user_message: str, turn: StructuredTurn) -> None:
-        memory.turns.append({"role": "user", "text": user_message})
+    def _persist_turn(
+        self,
+        memory: SessionMemory,
+        user_message: str,
+        turn: StructuredTurn,
+        *,
+        turn_no: int,
+    ) -> None:
+        now = utc_now()
         memory.turns.append(
-            {
-                "role": "assistant",
-                "text": turn.reply,
-                "intent": turn.intent.value,
-                "language": turn.detected_language.value,
-            }
+            TurnRecord(
+                turn_no=turn_no,
+                role="user",
+                text=user_message,
+                language=turn.detected_language.value,
+                timestamp=now,
+            )
+        )
+        memory.turns.append(
+            TurnRecord(
+                turn_no=turn_no,
+                role="assistant",
+                text=turn.reply,
+                language=turn.detected_language.value,
+                intent=turn.intent.value,
+                timestamp=now,
+            )
         )
         memory.language_history.append(turn.detected_language.value)
-        turn_no = sum(1 for record in memory.turns if record.get("role") == "user")
         memory.intent_history.append({"turn": turn_no, "intent": turn.intent.value})
         if turn.intent == Intent.objection:
             memory.objections.append(
@@ -559,6 +582,6 @@ class ConversationEngine:
             reply=reply,
             state=memory.state.value,
             language=language,
-            memory_snapshot=dict(memory.profile),
+            memory_snapshot=build_memory_snapshot(memory),
             booking=BookingSnapshot.model_validate(memory.booking),
         )
