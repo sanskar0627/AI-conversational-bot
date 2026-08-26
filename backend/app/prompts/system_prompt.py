@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.memory.schemas import ConversationState, SessionMemory
+from app.memory.schemas import ConversationState, LeadProfile, SessionMemory
+from app.memory.store import do_not_reask_fields, pending_confirmation_hint
 from app.models.llm_output import AgentAction, DetectedLanguage, Sentiment
 from app.prompts import facts
 from app.services.intent import Intent
@@ -115,7 +116,7 @@ CHAT_CHANNEL_VARIANT = """Chat-specific:
 
 BEHAVIOUR_PLAYBOOKS_BLOCK = """## BEHAVIOUR PLAYBOOKS
 
-Qualification — ask at most one missing field per turn, and only after answering the customer. Priority when a field is missing: configuration (2 vs 3 BHK) → budget comfort → timeline → name → phone (only when booking or a callback is needed) → purpose, financing, and city (opportunistic, never blocking). Weave the question into the answer; do not fire a form. Skip qualification entirely in ObjectionHandling, FollowUp, NotInterested, and Stopped. If they volunteer several fields, extract all of them (extraction is free; questioning is rationed). Vague answers ("budget theek hi hai") get one clarifying follow-up, then move on.
+Qualification — ask at most one missing field per turn, and only after answering the customer. Priority when a field is missing: configuration (2 vs 3 BHK) → budget comfort → timeline → name → phone (only when booking or a callback is needed) → purpose, financing, and city (opportunistic, never blocking). Weave the question into the answer; do not fire a form. Skip qualification entirely in ObjectionHandling, FollowUp, NotInterested, and Stopped. If they volunteer several fields, extract all of them (extraction is free; questioning is rationed). Vague answers ("budget theek hi hai") get one clarifying follow-up, then the field is marked uncertain — never re-ask an uncertain field that KNOWN CUSTOMER INFO says was already clarified.
 
 Objections — always: acknowledge → empathize → one honest value point from FACTS → soft CTA. Never invent a discount.
 - Too expensive: onwards pricing; payment plans/loan options can be discussed with the team; visit to judge value. Capture budget.
@@ -192,8 +193,35 @@ def _channel_rules_block(channel: str) -> str:
     )
 
 
-def _profile_lines(profile: dict[str, Any]) -> list[str]:
+def _profile_lines(profile: LeadProfile | dict[str, Any]) -> list[str]:
     lines: list[str] = []
+    if isinstance(profile, LeadProfile):
+        budget = profile.budget_display()
+        for key, field in profile.populated_fields():
+            if key in {"budget_min", "budget_max"}:
+                continue
+            suffix = f" (confidence: {field.confidence.value})"
+            lines.append(f"- {key}: {field.value}{suffix}")
+        if budget:
+            source = profile.budget_min or profile.budget_max
+            suffix = ""
+            if source is not None:
+                suffix = f" (confidence: {source.confidence.value})"
+            lines.append(f"- budget: {budget}{suffix}")
+        return lines
+    for key, value in profile.items():
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, dict):
+            inner = value.get("value", value)
+            confidence = value.get("confidence")
+            if inner in (None, ""):
+                continue
+            suffix = f" (confidence: {confidence})" if confidence not in (None, "") else ""
+            lines.append(f"- {key}: {inner}{suffix}")
+        else:
+            lines.append(f"- {key}: {value}")
+    return lines
     for key, value in profile.items():
         if value in (None, "", [], {}):
             continue
@@ -211,8 +239,28 @@ def _profile_lines(profile: dict[str, Any]) -> list[str]:
 
 def _format_known(memory: SessionMemory | None) -> str:
     lines: list[str] = []
+    extra_rules: list[str] = []
     if memory is not None:
         lines.extend(_profile_lines(memory.profile))
+        skip = do_not_reask_fields(memory.profile)
+        if skip:
+            extra_rules.append(
+                "Do not re-ask: " + ", ".join(skip) + "."
+            )
+        uncertain = [
+            name
+            for name, field in memory.profile.populated_fields()
+            if field.confidence.value == "uncertain" and field.clarification_asked
+        ]
+        if uncertain:
+            extra_rules.append(
+                "Already clarified once and still uncertain — do not ask again: "
+                + ", ".join(uncertain)
+                + "."
+            )
+        hint = pending_confirmation_hint(memory)
+        if hint:
+            extra_rules.append(f"PENDING CONFIRMATION: {hint}")
         booking = memory.booking or {}
         status = booking.get("status")
         if status and status != "none":
@@ -233,7 +281,18 @@ def _format_known(memory: SessionMemory | None) -> str:
             if types:
                 lines.append(f"- objections_so_far: {', '.join(str(t) for t in types)}")
     body = "\n".join(lines) if lines else "(none yet)"
-    return f"{KNOWN_CUSTOMER_INFO_HEADER}\n{NEVER_REASK_RULE}\n{body}"
+    rules = "\n".join([NEVER_REASK_RULE, *extra_rules])
+    return f"{KNOWN_CUSTOMER_INFO_HEADER}\n{rules}\n{body}"
+
+
+def _format_recent_turns(memory: SessionMemory | None) -> str:
+    if memory is None or not memory.turns:
+        return "Recent turns: (none)"
+    lines = []
+    for record in memory.recent_turns():
+        text = (record.text or "").replace("\n", " ").strip()
+        lines.append(f"- [{record.role}] {text}")
+    return "Recent turns:\n" + "\n".join(lines)
 
 
 def _format_state(
@@ -262,12 +321,14 @@ def _format_state(
     language_text = previous_language or "(unknown)"
     intents_text = ", ".join(recent_intents) if recent_intents else "(none)"
     tool_text = (tool_result or "").strip() or "(none this turn)"
+    recent = _format_recent_turns(memory)
     return (
         f"{CONVERSATION_STATE_HEADER}\n"
         f"Current state: {state_value}\n"
         f"Previous customer language: {language_text}\n"
         f"Recent intents: {intents_text}\n"
         f"Rolling summary: {summary_text}\n"
+        f"{recent}\n"
         f"TOOL RESULT: {tool_text}"
     )
 
