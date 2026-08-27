@@ -203,7 +203,8 @@ async def test_booking_failure_x2_engine_escalates_with_payload() -> None:
     )
     session = store.create("chat")
     session.state = ConversationState.BOOKING
-    session.profile = {"name": "Rahul", "phone": "9810012345", "slot_id": "stub-sat-1100"}
+    session.profile = {"name": "Rahul", "phone": "9810012345"}
+    session.booking["slot"] = "stub-sat-1100"
     store.save(session)
 
     first = await engine.handle_turn(session.session_id, "book Saturday 11")
