@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,6 +15,10 @@ IST = ZoneInfo("Asia/Kolkata")
 HORIZON_DAYS = 7
 SLOT_HOURS = (10, 12, 14, 16)
 SLOT_ID_FORMAT = "%Y-%m-%d-%H%M"
+UNAVAILABLE_SEED = 79
+UNAVAILABLE_PERCENT = 22
+SUNDAY = 6
+SUNDAY_MORNING_HOUR = 10
 
 NowFn = Callable[[], datetime]
 
@@ -57,8 +62,27 @@ class VisitSlot:
         return SlotInfo(slot_id=self.slot_id, label=self.label, available=self.available)
 
 
-def generate_inventory(now: datetime, *, days: int = HORIZON_DAYS) -> list[VisitSlot]:
-    """Next `days` calendar days, 10:00–18:00 in 2-hour slots (IST)."""
+def is_sunday_morning(starts_at: datetime) -> bool:
+    """Sunday 10:00 is the demo trigger: offered, but booking later fails as taken."""
+    return starts_at.weekday() == SUNDAY and starts_at.hour == SUNDAY_MORNING_HOUR
+
+
+def _seeded_unavailable(slot_id: str, *, seed: int = UNAVAILABLE_SEED) -> bool:
+    digest = hashlib.sha256(f"{seed}:{slot_id}".encode()).hexdigest()
+    return int(digest[:8], 16) % 100 < UNAVAILABLE_PERCENT
+
+
+def generate_inventory(
+    now: datetime,
+    *,
+    days: int = HORIZON_DAYS,
+    seed: int = UNAVAILABLE_SEED,
+) -> list[VisitSlot]:
+    """Next `days` calendar days, 10:00–18:00 in 2-hour slots (IST).
+
+    A seeded subset is marked unavailable so demos stay reproducible. Sunday
+    morning stays listed so the assignment's slot-taken path can be triggered.
+    """
     if now.tzinfo is None:
         now = now.replace(tzinfo=IST)
     else:
@@ -68,31 +92,60 @@ def generate_inventory(now: datetime, *, days: int = HORIZON_DAYS) -> list[Visit
     for offset in range(days):
         day = start_day + timedelta(days=offset)
         for hour in SLOT_HOURS:
-            starts_at = datetime(day.year, day.month, day.day, hour, 0, tzinfo=IST)
+            starts_at = datetime(
+                day.year, day.month, day.day, hour, 0, tzinfo=IST
+            )
             if starts_at <= now:
                 continue
+            slot_id = make_slot_id(starts_at)
+            unavailable = _seeded_unavailable(slot_id, seed=seed) and not is_sunday_morning(
+                starts_at
+            )
             slots.append(
                 VisitSlot(
-                    slot_id=make_slot_id(starts_at),
+                    slot_id=slot_id,
                     starts_at=starts_at,
-                    available=True,
+                    available=not unavailable,
                 )
             )
     return slots
 
 
+def format_slot_offer(slots: list[SlotInfo]) -> str:
+    """Deterministic offer line the engine injects into the agent reply."""
+    labels = ", ".join(slot.label for slot in slots)
+    return f"Available: {labels}." if labels else "Available: (none right now)."
+
+
 class BookingService:
     """In-memory slot inventory. Simulator attempts come after the inventory lands."""
 
-    def __init__(self, *, now_fn: NowFn | None = None) -> None:
+    def __init__(self, *, now_fn: NowFn | None = None, seed: int = UNAVAILABLE_SEED) -> None:
         self._now = now_fn or _now_ist
+        self._seed = seed
 
     def list_inventory(self) -> list[VisitSlot]:
-        return generate_inventory(self._now())
+        return generate_inventory(self._now(), seed=self._seed)
+
+    def get_slot(self, slot_id: str) -> VisitSlot | None:
+        return next((slot for slot in self.list_inventory() if slot.slot_id == slot_id), None)
 
     def get_available_slots(self, limit: int = 8) -> list[SlotInfo]:
         open_slots = [slot for slot in self.list_inventory() if slot.available]
         return [slot.to_info() for slot in open_slots[:limit]]
+
+    def nearest_alternatives(self, slot_id: str, *, limit: int = 3) -> list[SlotInfo]:
+        """Open slots closest in time to `slot_id`, excluding the requested one."""
+        target = parse_slot_id(slot_id) or self._now()
+        ranked = sorted(
+            (
+                slot
+                for slot in self.list_inventory()
+                if slot.available and slot.slot_id != slot_id
+            ),
+            key=lambda slot: abs((slot.starts_at - target).total_seconds()),
+        )
+        return [slot.to_info() for slot in ranked[:limit]]
 
     def attempt_booking(
         self,
