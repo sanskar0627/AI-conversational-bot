@@ -70,7 +70,9 @@ def test_session_chat_booking_analytics_round_trip(client: TestClient, fake_llm:
 
     slots = client.get("/api/booking/slots", params={"session_id": session_id})
     assert slots.status_code == 200
-    assert slots.json()["slots"]
+    offered = slots.json()["slots"]
+    assert offered
+    slot_id = offered[0]["slot_id"]
 
     booked = client.post(
         "/api/book-site-visit",
@@ -78,7 +80,7 @@ def test_session_chat_booking_analytics_round_trip(client: TestClient, fake_llm:
             "session_id": session_id,
             "name": "Rahul",
             "phone": "9810012345",
-            "slot_id": "stub-sat-1100",
+            "slot_id": slot_id,
         },
     )
     assert booked.status_code == 200
@@ -180,7 +182,7 @@ def test_invalid_booking_phone_is_validation_error(client: TestClient) -> None:
             "session_id": session_id,
             "name": "Rahul",
             "phone": "12345",
-            "slot_id": "stub-sat-1100",
+            "slot_id": "not-a-slot",
         },
     )
     assert response.status_code == 422
