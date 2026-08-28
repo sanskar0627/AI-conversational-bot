@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 PHONE_PATTERN = re.compile(r"^(\+91)?[6-9]\d{9}$")
+SLOT_ID_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{4}$")
 
 
 def sanitize_user_text(text: str) -> str:
@@ -28,4 +29,9 @@ def is_valid_name(name: str) -> bool:
 
 
 def is_valid_slot_id(slot_id: str) -> bool:
-    return bool(slot_id.strip())
+    """Accept inventory ids like `2026-08-23-1100` (date + 24h start time)."""
+    if not slot_id or not SLOT_ID_PATTERN.fullmatch(slot_id.strip()):
+        return False
+    hour = int(slot_id.strip()[-4:-2])
+    minute = int(slot_id.strip()[-2:])
+    return 0 <= hour <= 23 and minute in {0, 30}
