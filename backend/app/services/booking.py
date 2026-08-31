@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import secrets
+import string
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,8 @@ SUNDAY = 6
 SUNDAY_MORNING_HOUR = 10
 FAILURE_DETERMINISTIC = "deterministic"
 FAILURE_ALWAYS_ONCE = "always_fail_once"
+CONFIRMATION_PREFIX = "NS-"
+CONFIRMATION_ALPHABET = string.ascii_uppercase + string.digits
 
 NowFn = Callable[[], datetime]
 
@@ -114,6 +118,11 @@ def generate_inventory(
     return slots
 
 
+def mint_confirmation_id() -> str:
+    token = "".join(secrets.choice(CONFIRMATION_ALPHABET) for _ in range(6))
+    return f"{CONFIRMATION_PREFIX}{token}"
+
+
 def format_slot_offer(slots: list[SlotInfo]) -> str:
     """Deterministic offer line the engine injects into the agent reply."""
     labels = ", ".join(slot.label for slot in slots)
@@ -135,9 +144,14 @@ class BookingService:
         settings = get_settings()
         self._failure_mode = (failure_mode if failure_mode is not None else settings.booking_failure_mode).strip()
         self._forced_fail_sessions: set[str] = set()
+        self._taken: set[str] = set()
 
     def list_inventory(self) -> list[VisitSlot]:
-        return generate_inventory(self._now(), seed=self._seed)
+        slots = generate_inventory(self._now(), seed=self._seed)
+        return [
+            replace(slot, available=False) if slot.slot_id in self._taken else slot
+            for slot in slots
+        ]
 
     def get_slot(self, slot_id: str) -> VisitSlot | None:
         return next((slot for slot in self.list_inventory() if slot.slot_id == slot_id), None)
@@ -196,10 +210,12 @@ class BookingService:
                 reason="slot_taken",
                 alternatives=self.nearest_alternatives(slot_id, limit=3),
             )
+        self._taken.add(slot_id)
         return BookingResponse(
             success=True,
-            confirmation_id="NS-STUB01",
+            confirmation_id=mint_confirmation_id(),
             slot=slot_id,
+            slot_label=matching.label,
         )
 
     def _should_force_system_error(self, session_id: str) -> bool:

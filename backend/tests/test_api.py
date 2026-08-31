@@ -85,7 +85,9 @@ def test_session_chat_booking_analytics_round_trip(client: TestClient, fake_llm:
     )
     assert booked.status_code == 200
     assert booked.json()["success"] is True
-    assert booked.json()["confirmation_id"] == "NS-STUB01"
+    confirmation_id = booked.json()["confirmation_id"]
+    assert confirmation_id.startswith("NS-")
+    assert len(confirmation_id) == 9
 
     ended = client.post("/api/end-session", json={"session_id": session_id})
     assert ended.status_code == 200

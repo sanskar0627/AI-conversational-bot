@@ -44,6 +44,7 @@ class BookingResponse(BaseModel):
     success: bool
     confirmation_id: str | None = None
     slot: str | None = None
+    slot_label: str | None = None
     reason: str | None = None
     alternatives: list[SlotInfo] | None = None
 
