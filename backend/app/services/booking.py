@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from app.config import get_settings
 from app.models.responses import BookingResponse, SlotInfo
 from app.utils.validators import is_valid_name, is_valid_phone, is_valid_slot_id
 
@@ -19,6 +20,8 @@ UNAVAILABLE_SEED = 79
 UNAVAILABLE_PERCENT = 22
 SUNDAY = 6
 SUNDAY_MORNING_HOUR = 10
+FAILURE_DETERMINISTIC = "deterministic"
+FAILURE_ALWAYS_ONCE = "always_fail_once"
 
 NowFn = Callable[[], datetime]
 
@@ -120,9 +123,18 @@ def format_slot_offer(slots: list[SlotInfo]) -> str:
 class BookingService:
     """In-memory slot inventory. Simulator attempts come after the inventory lands."""
 
-    def __init__(self, *, now_fn: NowFn | None = None, seed: int = UNAVAILABLE_SEED) -> None:
+    def __init__(
+        self,
+        *,
+        now_fn: NowFn | None = None,
+        seed: int = UNAVAILABLE_SEED,
+        failure_mode: str | None = None,
+    ) -> None:
         self._now = now_fn or _now_ist
         self._seed = seed
+        settings = get_settings()
+        self._failure_mode = (failure_mode if failure_mode is not None else settings.booking_failure_mode).strip()
+        self._forced_fail_sessions: set[str] = set()
 
     def list_inventory(self) -> list[VisitSlot]:
         return generate_inventory(self._now(), seed=self._seed)
@@ -164,7 +176,21 @@ class BookingService:
             (slot for slot in self.list_inventory() if slot.slot_id == slot_id),
             None,
         )
-        if matching is None or not matching.available:
+        if matching is None:
+            return BookingResponse(
+                success=False,
+                reason="slot_taken",
+                alternatives=self.nearest_alternatives(slot_id, limit=3),
+            )
+
+        if self._should_force_system_error(session_id):
+            return BookingResponse(
+                success=False,
+                reason="system_error",
+                alternatives=self.nearest_alternatives(slot_id, limit=3),
+            )
+
+        if is_sunday_morning(matching.starts_at) or not matching.available:
             return BookingResponse(
                 success=False,
                 reason="slot_taken",
@@ -175,3 +201,11 @@ class BookingService:
             confirmation_id="NS-STUB01",
             slot=slot_id,
         )
+
+    def _should_force_system_error(self, session_id: str) -> bool:
+        if self._failure_mode != FAILURE_ALWAYS_ONCE:
+            return False
+        if session_id in self._forced_fail_sessions:
+            return False
+        self._forced_fail_sessions.add(session_id)
+        return True
