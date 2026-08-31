@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from app.models.responses import BookingResponse, SlotInfo
-from app.utils.validators import is_valid_slot_id
+from app.utils.validators import is_valid_name, is_valid_phone, is_valid_slot_id
 
 IST = ZoneInfo("Asia/Kolkata")
 HORIZON_DAYS = 7
@@ -155,6 +155,11 @@ class BookingService:
         phone: str,
         slot_id: str,
     ) -> BookingResponse:
+        if not is_valid_name(name or ""):
+            return BookingResponse(success=False, reason="invalid_name")
+        if not is_valid_phone(phone or ""):
+            return BookingResponse(success=False, reason="invalid_phone")
+
         matching = next(
             (slot for slot in self.list_inventory() if slot.slot_id == slot_id),
             None,
@@ -163,7 +168,7 @@ class BookingService:
             return BookingResponse(
                 success=False,
                 reason="slot_taken",
-                alternatives=self.get_available_slots(limit=3),
+                alternatives=self.nearest_alternatives(slot_id, limit=3),
             )
         return BookingResponse(
             success=True,
