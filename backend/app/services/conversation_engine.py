@@ -17,9 +17,18 @@ from app.memory.schemas import (
 from app.memory.store import SessionStore, build_memory_snapshot, merge_extracted_fields
 from app.memory.summary import refresh_rolling_summary
 from app.models.llm_output import AgentAction, DetectedLanguage, ExtractedFields, StructuredTurn
-from app.models.responses import BookingSnapshot, ChatResponse
+from app.models.responses import BookingResponse, BookingSnapshot, ChatResponse
 from app.prompts import facts, system_prompt
-from app.services.booking import BookingService, format_slot_offer
+from app.services.booking import (
+    BookingService,
+    apply_booking_result,
+    format_cancel_reply,
+    format_confirmation_reply,
+    format_failure_reply,
+    format_slot_offer,
+    format_validation_reply,
+)
+from app.utils.validators import is_valid_name, is_valid_phone
 from app.services.escalation import EscalationService
 from app.services.intent import (
     Intent,
@@ -223,7 +232,9 @@ def next_state(
 
     if booking_event == "failed":
         return ConversationState.BOOKING_FAILED
-    if action == AgentAction.propose_slots or booking_event == "retry":
+    if booking_event == "cancelled":
+        return ConversationState.FOLLOW_UP
+    if action == AgentAction.propose_slots or booking_event in {"retry", "rescheduled"}:
         return ConversationState.BOOKING
 
     mapped = TRANSITION_TABLE.get((state, intent), state)
@@ -462,33 +473,73 @@ class ConversationEngine:
             turn.reply = format_slot_offer(slots)
             return "retry" if memory.state == ConversationState.BOOKING_FAILED else None
 
+        if turn.intent == Intent.cancel_booking:
+            return self._cancel_booking(memory, turn)
+
         if turn.action != AgentAction.confirm_booking:
             return None
 
         name = memory.profile.get("name")
         phone = memory.profile.get("phone")
-        slot_id = memory.booking.get("slot")
-        if not name or not phone or not slot_id:
+        offered = list(memory.booking.get("offered_slots") or [])
+        slot_id = self._booking.resolve_slot_id(user_message, offered) or memory.booking.get(
+            "slot"
+        )
+
+        if not is_valid_name(str(name or "")) or not is_valid_phone(str(phone or "")):
+            reason = "invalid_phone" if not is_valid_phone(str(phone or "")) else "invalid_name"
+            apply_booking_result(
+                memory,
+                BookingResponse(success=False, reason=reason),
+                event="validation",
+            )
+            turn.reply = format_validation_reply(
+                reason, attempts=int(memory.booking.get("validation_attempts") or 0)
+            )
             return None
 
-        result = self._booking.attempt_booking(
-            session_id=memory.session_id,
-            name=str(name),
-            phone=str(phone),
-            slot_id=str(slot_id),
-        )
-        history = memory.booking.setdefault("history", [])
-        if result.success:
-            memory.booking["status"] = "confirmed"
-            memory.booking["confirmation_id"] = result.confirmation_id
-            memory.booking["slot"] = result.slot
-            history.append({"event": "confirmed", "id": result.confirmation_id})
-            return "confirmed"
+        if not slot_id:
+            slots = self._booking.get_available_slots(limit=3)
+            memory.booking["offered_slots"] = [slot.slot_id for slot in slots]
+            turn.reply = format_slot_offer(slots)
+            return None
 
-        memory.booking["failure_count"] = int(memory.booking.get("failure_count") or 0) + 1
-        memory.booking["status"] = "failed"
-        history.append({"event": "failed", "reason": result.reason})
+        already_confirmed = memory.booking.get("status") == "confirmed"
+        if already_confirmed and slot_id != memory.booking.get("slot"):
+            result = self._booking.reschedule(
+                session_id=memory.session_id,
+                name=str(name),
+                phone=str(phone),
+                old_slot_id=memory.booking.get("slot"),
+                new_slot_id=str(slot_id),
+            )
+            event = "rescheduled" if result.success else "failed"
+        else:
+            result = self._booking.attempt_booking(
+                session_id=memory.session_id,
+                name=str(name),
+                phone=str(phone),
+                slot_id=str(slot_id),
+            )
+            event = "confirmed" if result.success else "failed"
+
+        apply_booking_result(memory, result, event=event, requested_slot=str(slot_id))
+        if result.success:
+            turn.reply = format_confirmation_reply(result)
+            return event
+        turn.reply = format_failure_reply(result)
         return "failed"
+
+    def _cancel_booking(self, memory: SessionMemory, turn: StructuredTurn) -> str | None:
+        if memory.booking.get("status") != "confirmed":
+            turn.reply = (
+                "I don't have a confirmed visit to cancel. Would you like to pick a slot?"
+            )
+            return None
+        result = self._booking.cancel(slot_id=memory.booking.get("slot"))
+        apply_booking_result(memory, result, event="cancelled")
+        turn.reply = format_cancel_reply(result.slot_label)
+        return "cancelled"
 
     def _advance_state(
         self,
