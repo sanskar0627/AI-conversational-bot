@@ -19,7 +19,7 @@ from app.memory.summary import refresh_rolling_summary
 from app.models.llm_output import AgentAction, DetectedLanguage, ExtractedFields, StructuredTurn
 from app.models.responses import BookingSnapshot, ChatResponse
 from app.prompts import facts, system_prompt
-from app.services.booking import BookingService
+from app.services.booking import BookingService, format_slot_offer
 from app.services.escalation import EscalationService
 from app.services.intent import (
     Intent,
@@ -342,10 +342,9 @@ class ConversationEngine:
             turn_no=turn_no,
             user_message=message,
         )
+        booking_event = self._execute_booking_action(memory, turn, user_message=message)
         self._persist_turn(memory, message, turn, turn_no=turn_no)
         await refresh_rolling_summary(memory, self._llm)
-
-        booking_event = self._execute_booking_action(memory, turn)
         reason = self._escalation.should_escalate(
             memory, turn, user_message=message, start_state=start_state
         )
@@ -445,15 +444,22 @@ class ConversationEngine:
         return messages
 
     def _execute_booking_action(
-        self, memory: SessionMemory, turn: StructuredTurn
+        self, memory: SessionMemory, turn: StructuredTurn, *, user_message: str = ""
     ) -> str | None:
-        """Delegate propose/confirm to BookingService (stub until Stage 06)."""
+        """Run booking tools and overwrite the reply with simulator-produced text."""
+        if turn.intent == Intent.reschedule and turn.action != AgentAction.confirm_booking:
+            turn.action = AgentAction.propose_slots
+
         if turn.action == AgentAction.propose_slots:
-            slots = self._booking.get_available_slots()
-            memory.booking["status"] = "slots_offered"
+            slots = self._booking.get_available_slots(limit=3)
+            if memory.booking.get("status") != "confirmed":
+                memory.booking["status"] = "slots_offered"
+            memory.booking["offered_slots"] = [slot.slot_id for slot in slots]
+            memory.booking["alternatives"] = [slot.model_dump() for slot in slots]
             memory.booking.setdefault("history", []).append(
                 {"event": "propose_slots", "count": len(slots)}
             )
+            turn.reply = format_slot_offer(slots)
             return "retry" if memory.state == ConversationState.BOOKING_FAILED else None
 
         if turn.action != AgentAction.confirm_booking:
