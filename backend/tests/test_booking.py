@@ -20,8 +20,20 @@ from app.services.booking import (
 FROZEN = datetime(2026, 9, 2, 9, 0, tzinfo=IST)  # Wednesday morning
 
 
-def _service() -> BookingService:
-    return BookingService(now_fn=lambda: FROZEN)
+def _service(*, failure_mode: str = "deterministic") -> BookingService:
+    return BookingService(now_fn=lambda: FROZEN, failure_mode=failure_mode)
+
+
+def _open_slot(service: BookingService):
+    return next(
+        slot
+        for slot in service.list_inventory()
+        if slot.available and not is_sunday_morning(slot.starts_at)
+    )
+
+
+def _sunday_morning_slot(service: BookingService):
+    return next(slot for slot in service.list_inventory() if is_sunday_morning(slot.starts_at))
 
 
 def test_inventory_covers_next_seven_days_in_two_hour_slots() -> None:
@@ -77,3 +89,65 @@ def test_past_slots_on_the_same_day_are_omitted() -> None:
     assert 10 not in today_hours
     assert 12 not in today_hours
     assert today_hours[0] == 14
+
+
+def test_happy_path_returns_confirmation_id_and_removes_slot() -> None:
+    service = _service()
+    slot = _open_slot(service)
+    result = service.attempt_booking(
+        session_id="sess-ok",
+        name="Rahul",
+        phone="9810012345",
+        slot_id=slot.slot_id,
+    )
+    assert result.success is True
+    assert result.confirmation_id is not None
+    assert result.confirmation_id.startswith("NS-")
+    assert len(result.confirmation_id) == 9
+    assert result.slot == slot.slot_id
+    assert result.slot_label == slot.label
+    taken = service.get_slot(slot.slot_id)
+    assert taken is not None and taken.available is False
+    assert slot.slot_id not in {item.slot_id for item in service.get_available_slots(limit=20)}
+
+
+def test_sunday_morning_fails_deterministically_with_three_alternatives() -> None:
+    service = _service()
+    sunday = _sunday_morning_slot(service)
+    result = service.attempt_booking(
+        session_id="sess-sun",
+        name="Rahul",
+        phone="9810012345",
+        slot_id=sunday.slot_id,
+    )
+    assert result.success is False
+    assert result.reason == "slot_taken"
+    assert result.alternatives is not None
+    assert len(result.alternatives) == 3
+    assert sunday.slot_id not in {item.slot_id for item in result.alternatives}
+    assert service.get_slot(sunday.slot_id) is not None
+    assert sunday.slot_id not in service._taken
+
+
+def test_always_fail_once_returns_system_error_then_succeeds() -> None:
+    service = _service(failure_mode="always_fail_once")
+    slot = _open_slot(service)
+    first = service.attempt_booking(
+        session_id="sess-glitch",
+        name="Rahul",
+        phone="9810012345",
+        slot_id=slot.slot_id,
+    )
+    assert first.success is False
+    assert first.reason == "system_error"
+    assert first.alternatives is not None
+    assert len(first.alternatives) == 3
+
+    second = service.attempt_booking(
+        session_id="sess-glitch",
+        name="Rahul",
+        phone="9810012345",
+        slot_id=slot.slot_id,
+    )
+    assert second.success is True
+    assert second.confirmation_id is not None
