@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from app.memory.schemas import SessionMemory
+from app.models.responses import BookingResponse
 from app.services.booking import (
+    FOLLOW_UP_CANCELLED,
     HORIZON_DAYS,
     IST,
     SLOT_HOURS,
     BookingService,
+    apply_booking_result,
     format_slot_label,
     format_slot_offer,
     generate_inventory,
@@ -151,3 +155,135 @@ def test_always_fail_once_returns_system_error_then_succeeds() -> None:
     )
     assert second.success is True
     assert second.confirmation_id is not None
+
+
+def test_invalid_name_and_phone_never_take_a_slot() -> None:
+    service = _service()
+    slot = _open_slot(service)
+    bad_phone = service.attempt_booking(
+        session_id="sess-bad",
+        name="Rahul",
+        phone="12345",
+        slot_id=slot.slot_id,
+    )
+    assert bad_phone.success is False
+    assert bad_phone.reason == "invalid_phone"
+    bad_name = service.attempt_booking(
+        session_id="sess-bad",
+        name="R",
+        phone="9810012345",
+        slot_id=slot.slot_id,
+    )
+    assert bad_name.success is False
+    assert bad_name.reason == "invalid_name"
+    still_open = service.get_slot(slot.slot_id)
+    assert still_open is not None and still_open.available is True
+
+
+def test_reschedule_issues_new_id_and_frees_the_old_slot() -> None:
+    service = _service()
+    first = _open_slot(service)
+    booked = service.attempt_booking(
+        session_id="sess-move",
+        name="Rahul",
+        phone="9810012345",
+        slot_id=first.slot_id,
+    )
+    second = next(
+        slot
+        for slot in service.list_inventory()
+        if slot.available and not is_sunday_morning(slot.starts_at)
+    )
+    moved = service.reschedule(
+        session_id="sess-move",
+        name="Rahul",
+        phone="9810012345",
+        old_slot_id=first.slot_id,
+        new_slot_id=second.slot_id,
+    )
+    assert moved.success is True
+    assert moved.confirmation_id != booked.confirmation_id
+    assert moved.slot == second.slot_id
+    freed = service.get_slot(first.slot_id)
+    held = service.get_slot(second.slot_id)
+    assert freed is not None and freed.available is True
+    assert held is not None and held.available is False
+
+
+def test_failed_reschedule_keeps_the_original_slot() -> None:
+    service = _service()
+    first = _open_slot(service)
+    booked = service.attempt_booking(
+        session_id="sess-keep",
+        name="Rahul",
+        phone="9810012345",
+        slot_id=first.slot_id,
+    )
+    sunday = _sunday_morning_slot(service)
+    failed = service.reschedule(
+        session_id="sess-keep",
+        name="Rahul",
+        phone="9810012345",
+        old_slot_id=first.slot_id,
+        new_slot_id=sunday.slot_id,
+    )
+    assert failed.success is False
+    assert failed.reason == "slot_taken"
+    still_held = service.get_slot(first.slot_id)
+    assert still_held is not None and still_held.available is False
+    assert booked.slot == first.slot_id
+
+
+def test_cancel_frees_slot_and_sets_follow_up() -> None:
+    service = _service()
+    slot = _open_slot(service)
+    booked = service.attempt_booking(
+        session_id="sess-cancel",
+        name="Rahul",
+        phone="9810012345",
+        slot_id=slot.slot_id,
+    )
+    memory = SessionMemory(
+        session_id="sess-cancel",
+        channel="chat",
+        booking={
+            "status": "confirmed",
+            "slot": booked.slot,
+            "confirmation_id": booked.confirmation_id,
+            "failure_count": 0,
+            "history": [],
+        },
+    )
+    result = service.cancel(slot_id=booked.slot)
+    apply_booking_result(memory, result, event="cancelled")
+    freed = service.get_slot(slot.slot_id)
+    assert freed is not None and freed.available is True
+    assert memory.booking["status"] == "cancelled"
+    assert memory.booking["follow_up_required"] is True
+    assert memory.booking["follow_up_reason"] == FOLLOW_UP_CANCELLED
+    assert memory.booking["confirmation_id"] is None
+
+
+def test_apply_result_counts_failures_but_not_validation_errors() -> None:
+    memory = SessionMemory(session_id="sess-count", channel="chat")
+    apply_booking_result(
+        memory,
+        BookingResponse(success=False, reason="invalid_phone"),
+        event="validation",
+    )
+    assert memory.booking["failure_count"] == 0
+    assert memory.booking["validation_attempts"] == 1
+    apply_booking_result(
+        memory,
+        BookingResponse(success=False, reason="slot_taken", alternatives=[]),
+        event="failed",
+        requested_slot="2026-09-06-1000",
+    )
+    apply_booking_result(
+        memory,
+        BookingResponse(success=False, reason="system_error", alternatives=[]),
+        event="failed",
+        requested_slot="2026-09-05-1000",
+    )
+    assert memory.booking["failure_count"] == 2
+    assert memory.booking["status"] == "failed"
