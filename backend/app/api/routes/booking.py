@@ -32,6 +32,14 @@ def book_site_visit(
 ) -> BookingResponse:
     session = store.get(payload.session_id)
     already_confirmed = session.booking.get("status") == "confirmed"
+    if already_confirmed and session.booking.get("slot") == payload.slot_id:
+        slot = booking.get_slot(payload.slot_id)
+        return BookingResponse(
+            success=True,
+            confirmation_id=session.booking.get("confirmation_id"),
+            slot=payload.slot_id,
+            slot_label=slot.label if slot else None,
+        )
     if already_confirmed and session.booking.get("slot") != payload.slot_id:
         result = booking.reschedule(
             session_id=payload.session_id,
