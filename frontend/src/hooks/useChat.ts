@@ -86,6 +86,13 @@ export function useChat(
         const error = toApiError(cause)
         if (error.code === ERROR_CREDITS_EXHAUSTED) {
           onBanner('credits')
+          // Keep the message retryable so it can be resent once the health
+          // poll clears the banner and the input is re-enabled.
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === userMessage.id ? { ...message, retryable: true } : message,
+            ),
+          )
         } else if (error.code === ERROR_SESSION_EXPIRED || error.status === 410) {
           onSessionExpired()
         } else {
