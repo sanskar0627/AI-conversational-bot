@@ -5,6 +5,7 @@ import { ChatInput } from './components/ChatInput'
 import { ChatWindow } from './components/ChatWindow'
 import { ErrorBanner } from './components/ErrorBanner'
 import { MemoryPanel } from './components/MemoryPanel'
+import { SessionModal } from './components/SessionModal'
 import { useChat } from './hooks/useChat'
 import type { BannerKind } from './hooks/useChat'
 import { useSession } from './hooks/useSession'
@@ -204,6 +205,8 @@ function App() {
           </div>
         </aside>
       </main>
+
+      {session.status === 'expired' && <SessionModal onNewSession={handleNewConversation} />}
     </div>
   )
 }
