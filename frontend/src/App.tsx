@@ -9,7 +9,7 @@ import { SessionModal } from './components/SessionModal'
 import { useChat } from './hooks/useChat'
 import type { BannerKind } from './hooks/useChat'
 import { useSession } from './hooks/useSession'
-import { bookSiteVisit, fetchSlots, toApiError } from './lib/api'
+import { bookSiteVisit, fetchHealth, fetchSlots, toApiError } from './lib/api'
 import type { HealthResponse, SlotInfo } from './lib/types'
 
 const HEALTH_POLL_INTERVAL_MS = 30_000
