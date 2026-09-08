@@ -8,6 +8,7 @@ type BookingCardProps = {
   busy: boolean
   disabled: boolean
   onBook: (slotId: string, name: string, phone: string) => void
+  onCancel: () => void
 }
 
 function profileValue(memory: MemorySnapshot | null, key: string): string {
@@ -21,9 +22,11 @@ function slotLabel(slots: SlotInfo[], slotId: string | null): string {
   return slots.find((slot) => slot.slot_id === slotId)?.label ?? slotId
 }
 
-export function BookingCard({ booking, memory, slots, busy, disabled, onBook }: BookingCardProps) {
+export function BookingCard({ booking, memory, slots, busy, disabled, onBook, onCancel }: BookingCardProps) {
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
+  const [rescheduling, setRescheduling] = useState(false)
+  const [confirmingCancel, setConfirmingCancel] = useState(false)
 
   useEffect(() => {
     const knownName = profileValue(memory, 'name')
@@ -73,6 +76,100 @@ export function BookingCard({ booking, memory, slots, busy, disabled, onBook }: 
               <span className="font-mono font-medium">{booking.confirmation_id}</span>
             </p>
           )}
+          <div className="mt-2 flex gap-2">
+            <button
+              type="button"
+              disabled={disabled || busy}
+              onClick={() => {
+                setRescheduling((current) => !current)
+                setConfirmingCancel(false)
+              }}
+              className="rounded-md bg-white px-2.5 py-1 text-xs font-medium text-emerald-900 ring-1 ring-emerald-300 hover:bg-emerald-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700 disabled:opacity-40"
+            >
+              {rescheduling ? 'Keep current slot' : 'Reschedule'}
+            </button>
+            {confirmingCancel ? (
+              <>
+                <button
+                  type="button"
+                  disabled={disabled || busy}
+                  onClick={() => {
+                    setConfirmingCancel(false)
+                    onCancel()
+                  }}
+                  className="rounded-md bg-red-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-red-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-700 disabled:opacity-40"
+                >
+                  Yes, cancel it
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmingCancel(false)}
+                  className="rounded-md px-2.5 py-1 text-xs font-medium text-stone-600 hover:bg-stone-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stone-400"
+                >
+                  Keep my visit
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                disabled={disabled || busy}
+                onClick={() => {
+                  setConfirmingCancel(true)
+                  setRescheduling(false)
+                }}
+                className="rounded-md bg-white px-2.5 py-1 text-xs font-medium text-red-700 ring-1 ring-red-300 hover:bg-red-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-700 disabled:opacity-40"
+              >
+                Cancel visit
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {confirmed && rescheduling && (
+        <div>
+          <h3 className="mb-1.5 text-xs font-medium uppercase tracking-wide text-stone-400">
+            Pick a new slot
+          </h3>
+          {(name.trim().length < 2 || phone.trim().length < 10) && (
+            <div className="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <input
+                type="text"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder="Your name"
+                aria-label="Name for rescheduling"
+                className="w-full rounded-md border border-stone-300 px-2.5 py-1.5 text-sm focus:border-indigo-900 focus:outline-none focus:ring-2 focus:ring-indigo-900/20"
+              />
+              <input
+                type="tel"
+                value={phone}
+                onChange={(event) => setPhone(event.target.value)}
+                placeholder="10-digit mobile"
+                aria-label="Phone for rescheduling"
+                className="w-full rounded-md border border-stone-300 px-2.5 py-1.5 text-sm focus:border-indigo-900 focus:outline-none focus:ring-2 focus:ring-indigo-900/20"
+              />
+            </div>
+          )}
+          <ul className="flex flex-wrap gap-1.5">
+            {slots
+              .filter((slot) => slot.available && slot.slot_id !== booking?.slot)
+              .map((slot) => (
+                <li key={slot.slot_id}>
+                  <button
+                    type="button"
+                    disabled={disabled || busy || name.trim().length < 2 || phone.trim().length < 10}
+                    onClick={() => {
+                      setRescheduling(false)
+                      onBook(slot.slot_id, name.trim(), phone.trim())
+                    }}
+                    className="rounded-full border border-indigo-200 bg-white px-3 py-1.5 text-xs font-medium text-indigo-900 hover:bg-indigo-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-900 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {slot.label}
+                  </button>
+                </li>
+              ))}
+          </ul>
         </div>
       )}
 

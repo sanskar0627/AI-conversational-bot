@@ -197,6 +197,7 @@ function App() {
                 busy={bookingBusy}
                 disabled={session.status !== 'active'}
                 onBook={(slotId, name, phone) => void handleBook(slotId, name, phone)}
+                onCancel={() => void chat.send('I want to cancel my site visit')}
               />
             )}
             {activeTab === 'analytics' && <AnalyticsView analytics={session.analytics} />}
